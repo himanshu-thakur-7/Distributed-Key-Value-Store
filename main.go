@@ -152,8 +152,8 @@ func (s *StoreTTL) GetTTL(key string) ([]byte, error) {
 
 		if ce.expiresAt != nil && time.Now().After(*ce.expiresAt) {
 			// expired
-			s.cache.data.Delete(key)
-			s.db.Exec("DELETE FROM kv WHERE key = $1", key)
+			// s.cache.data.Delete(key)
+			// s.db.Exec("DELETE FROM kv WHERE key = $1", key)
 
 			fmt.Printf("[GET] key=%s expired (cache)\n", key)
 
@@ -181,7 +181,7 @@ func (s *StoreTTL) GetTTL(key string) ([]byte, error) {
 
 	// 3. Expiry check
 	if expiresAt != nil && time.Now().After(*expiresAt) {
-		s.db.Exec("DELETE FROM kv WHERE key = $1", key)
+		// s.db.Exec("DELETE FROM kv WHERE key = $1", key)
 		fmt.Printf("[GET] key=%s expired {db}\n", key)
 	}
 
@@ -200,8 +200,53 @@ func TTLCodeExecution(storeTTL *StoreTTL) {
 	storeTTL.SetWithTTL("temp", []byte("hello"), 2)
 
 	storeTTL.GetTTL("temp")
-	time.Sleep(3 * time.Second)
+	time.Sleep(1 * time.Second)
 	storeTTL.GetTTL("temp")
+}
+
+// Expiry Worker
+func (s *StoreTTL) startExpiryWorker(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			s.cleanUpExpiredKeys()
+		}
+	}()
+}
+
+// method to clean up keys
+func (s *StoreTTL) cleanUpExpiredKeys() {
+	rows, err := s.db.Query(
+		`SELECT key FROM kv
+		WHERE expires_at IS NOT NULL
+		AND expires_at <= NOW()
+		LIMIT 100`,
+	)
+	if err != nil {
+		fmt.Println("[EXPIRY] query error:", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			continue
+		}
+
+		// Delete from DB
+		_, err := s.db.Exec("DELETE FROM kv WHERE key = $1", key)
+		if err != nil {
+			continue
+		}
+
+		// Delete from cache
+		s.cache.data.Delete(key)
+
+		fmt.Printf("[EXPIRY] deleted key=%s\n", key)
+	}
 }
 
 func main() {
@@ -212,7 +257,13 @@ func main() {
 	// store := &Store{db: db, cache: &Cache{}}
 
 	storeTTL := &StoreTTL{db: db, cache: &Cache{}}
+	storeTTL.SetWithTTL("ghost", []byte("boo"), 2)
+	// storeTTL.startExpiryWorker(5 * time.Second)
+	time.Sleep(2 * time.Second)
+	val, _ := storeTTL.GetTTL("ghost")
+	fmt.Println("ghost =", val)
 
 	// concurrentExecution(*store)
-	TTLCodeExecution(storeTTL)
+	// TTLCodeExecution(storeTTL)
+
 }
