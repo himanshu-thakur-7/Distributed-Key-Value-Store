@@ -4,9 +4,16 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"time"
 
 	_ "github.com/lib/pq"
 )
+
+// cache entry with expiration
+type CacheEntry struct {
+	value     []byte
+	expiresAt *time.Time
+}
 
 type Store struct {
 	cache sync.Map
@@ -34,7 +41,16 @@ func connectDB() *sql.DB {
 	return db
 }
 
-// SET method write to DB
+// Tombstone time for soft delete
+var TombstoneTime = time.Unix(0, 0).UTC()
+
+// soft delete
+func (s *Store) softDelete(key string) {
+	s.db.Exec("UPDATE kv SET expires_at = $1 WHERE key=$2", TombstoneTime, key)
+	s.cache.Delete(key)
+}
+
+// SET method write to DB without TTL
 func (s *Store) Set(key string, value []byte) error {
 	// write to db
 	_, err := s.db.Exec(`INSERT INTO kv (key, value) values ($1,$2) ON CONFLICT (key) DO UPDATE SET value = $2`,
@@ -43,20 +59,54 @@ func (s *Store) Set(key string, value []byte) error {
 		return err
 	}
 	//  update cache
-	s.cache.Store(key, value)
+	s.cache.Store(key, CacheEntry{
+		value:     value,
+		expiresAt: nil,
+	})
 	return nil
 }
 
-// GET method read from cache , fall back from db
+// SET with TTL
+func (s *Store) SetWithTTL(key string, value []byte, ttlSeconds int64) error {
+	expires_at := time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+
+	_, err := s.db.Exec(`
+	INSERT INTO kv (key,value,expires_at)
+	VALUES ($1,$2,$3)
+	ON CONFLICT (key)
+	DO UPDATE SET value = $2, expires_at = $3
+	`, key, value, expires_at)
+
+	if err != nil {
+		return err
+	}
+	s.cache.Store(key, CacheEntry{
+		value:     value,
+		expiresAt: &expires_at,
+	})
+
+	return nil
+}
+
+// GET method read from cache , fall back from db, with lazy expiration
 func (s *Store) Get(key string) ([]byte, error) {
 	// 1 try cache
 	if val, ok := s.cache.Load(key); ok {
-		return val.([]byte), nil
+		entry := val.(CacheEntry)
+
+		// check if expired
+		if entry.expiresAt != nil && time.Now().After(*entry.expiresAt) {
+			s.softDelete(key)
+			return nil, fmt.Errorf("key not found")
+		}
+		return entry.value, nil
 	}
 
 	// 2 cachce miss
 	var val []byte
-	err := s.db.QueryRow("SELECT value FROM kv WHERE key = $1", key).Scan(&val)
+	var expiresAt *time.Time
+
+	err := s.db.QueryRow("SELECT value FROM kv WHERE key = $1 AND (expires_at IS NULL or expires_at > NOW())", key).Scan(&val, &expiresAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("key not found")
 	}
@@ -65,21 +115,18 @@ func (s *Store) Get(key string) ([]byte, error) {
 	}
 
 	// 3 populate cache
-	s.cache.Store(key, val)
+	s.cache.Store(key, CacheEntry{
+		value:     val,
+		expiresAt: expiresAt,
+	})
 	return val, nil
 
 }
 
 // DELETE method
 func (s *Store) Delete(key string) error {
-	// Delete from DB
-	_, err := s.db.Exec("DELETE from kv WHERE key = $1", key)
-	if err != nil {
-		return err
-	}
-
-	// Delete from cache
-	s.cache.Delete(key)
+	// soft delete
+	s.softDelete(key)
 	return nil
 }
 
@@ -118,11 +165,35 @@ func main() {
 	// time.Sleep(100 * time.Millisecond)
 
 	// Read values
-	user1, _ := store.Get("user1")
-	user2, _ := store.Get("user2")
-	user3, _ := store.Get("user3")
+	// user1, _ := store.Get("user1")
+	// user2, _ := store.Get("user2")
+	// user3, _ := store.Get("user3")
 
-	fmt.Println("User1:", string(user1))
-	fmt.Println("User2:", string(user2))
-	fmt.Println("User3:", string(user3))
+	// fmt.Println("User1:", string(user1))
+	// fmt.Println("User2:", string(user2))
+	// fmt.Println("User3:", string(user3))
+
+	fmt.Println("\n--- Testing TTL ---")
+
+	store.SetWithTTL("temp", []byte("expires-soon"), 3)
+	fmt.Println(" Set temp with 3 second TTL")
+
+	val, _ := store.Get("temp")
+	fmt.Println(" Immediate GET:", string(val))
+
+	time.Sleep(2 * time.Second)
+	val, _ = store.Get("temp")
+	fmt.Println(" After 2 seconds:", string(val))
+
+	time.Sleep(2 * time.Second)
+	val, err := store.Get("temp")
+	if err != nil {
+		fmt.Println(" After 4 seconds:", err)
+	}
+
+	// Test permanent key
+	fmt.Println("\n--- Testing Permanent Key ---")
+	store.Set("permanent", []byte("no-expiry"))
+	val, _ = store.Get("permanent")
+	fmt.Println(" Permanent key:", string(val))
 }
