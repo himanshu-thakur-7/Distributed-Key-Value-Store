@@ -2,32 +2,47 @@ package main
 
 import "fmt"
 
-func Get(key string, store map[string][]byte) ([]byte, error) {
-	value := store[key]
+type Store struct {
+	data map[string][]byte
+}
+
+// constructor method
+func NewStore() *Store {
+	return &Store{
+		data: make(map[string][]byte),
+	}
+}
+
+// GET method
+func (s *Store) Get(key string) ([]byte, error) {
+	value := s.data[key]
 	if value == nil {
-		return nil, fmt.Errorf("key not found")
+		return nil, fmt.Errorf("Key not found")
 	}
 	return value, nil
 }
 
-func Set(key string, value []byte, store map[string][]byte) {
-	store[key] = value
+// Set nethod
+
+func (s *Store) Set(key string, value []byte) {
+	s.data[key] = value
 }
 
-func Delete(key string, store map[string][]byte) {
-	delete(store, key)
+// delete method
+func (s *Store) Delete(key string) {
+	delete(s.data, key)
 }
 
 func main() {
-	store := make(map[string][]byte)
+	store := NewStore()
 
 	// SET operation
 	// store["username"] =
-	Set("username", []byte("alice"), store)
-	Set("email", []byte("alice@gmail.com"), store)
+	store.Set("username", []byte("alice"))
+	store.Set("email", []byte("alice@gmail.com"))
 
 	// GET
-	username, err := Get("username", store)
+	username, err := store.Get("username")
 	if err == nil {
 		fmt.Println("Username:", string(username))
 	} else {
@@ -35,10 +50,10 @@ func main() {
 	}
 
 	// DEL
-	Delete("email", store)
+	store.Delete("email")
 
 	// Try to get deleted key
-	email, err := Get("email", store)
+	email, err := store.Get("email")
 	if email == nil {
 		fmt.Println("Email : (not found)")
 	} else {
