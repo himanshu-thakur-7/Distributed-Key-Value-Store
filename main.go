@@ -1,62 +1,57 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
 type Store struct {
-	data map[string][]byte
+	data sync.Map
 }
 
 // constructor method
 func NewStore() *Store {
-	return &Store{
-		data: make(map[string][]byte),
-	}
+	return &Store{}
 }
 
 // GET method
 func (s *Store) Get(key string) ([]byte, error) {
-	value := s.data[key]
-	if value == nil {
+	value, ok := s.data.Load(key)
+	if !ok {
 		return nil, fmt.Errorf("Key not found")
 	}
-	return value, nil
+	return value.([]byte), nil
 }
 
 // Set nethod
 
 func (s *Store) Set(key string, value []byte) {
-	s.data[key] = value
+	s.data.Store(key, value)
 }
 
 // delete method
 func (s *Store) Delete(key string) {
-	delete(s.data, key)
+	s.data.Delete(key)
 }
 
 func main() {
 	store := NewStore()
 
-	// SET operation
-	// store["username"] =
-	store.Set("username", []byte("alice"))
-	store.Set("email", []byte("alice@gmail.com"))
+	// Simulate concurrent access
+	go store.Set("user1", []byte("alice"))
+	go store.Set("user2", []byte("bob"))
+	go store.Set("user3", []byte("charlie"))
 
-	// GET
-	username, err := store.Get("username")
-	if err == nil {
-		fmt.Println("Username:", string(username))
-	} else {
-		fmt.Println("Error :", err)
-	}
+	// Wait a bit for goroutines to finish
+	time.Sleep(100 * time.Millisecond)
 
-	// DEL
-	store.Delete("email")
+	// Read values
+	user1, _ := store.Get("user1")
+	user2, _ := store.Get("user2")
+	user3, _ := store.Get("user3")
 
-	// Try to get deleted key
-	email, err := store.Get("email")
-	if email == nil {
-		fmt.Println("Email : (not found)")
-	} else {
-		fmt.Println("email: ", string(email))
-	}
+	fmt.Println("User1:", string(user1))
+	fmt.Println("User2:", string(user2))
+	fmt.Println("User3:", string(user3))
 }
