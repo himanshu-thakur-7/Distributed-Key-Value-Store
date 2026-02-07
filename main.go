@@ -27,6 +27,93 @@ func NewStore(db *sql.DB) *Store {
 	}
 }
 
+// StartExpiryWorker starts a background routine to clean up expired keys
+func (s *Store) StartExpiryWorker(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		fmt.Printf("Expiry worker started (interval: %v)\n", interval)
+
+		for range ticker.C {
+			s.cleanupCycle()
+		}
+	}()
+}
+
+func (s *Store) cleanupCycle() {
+	// STEP 1: Sample 20 random keys with TTL (include expired ones for counting)
+	rows, err := s.db.Query(`
+		SELECT key, expires_at
+		FROM kv
+		WHERE expires_at IS NOT NULL
+		ORDER BY random()
+		LIMIT 20
+	`)
+	if err != nil {
+		fmt.Println("[EXPIRY] Sample Error:", err)
+		return
+	}
+
+	defer rows.Close()
+
+	// STEP 2: count expired keys
+	now := time.Now()
+	totalSampled := 0
+	expiredCount := 0
+
+	for rows.Next() {
+		var key string
+		var expiresAt time.Time
+
+		if err := rows.Scan(&key, &expiresAt); err != nil {
+			continue
+		}
+
+		totalSampled++
+		if now.After(expiresAt) {
+			expiredCount++
+		}
+	}
+
+	if totalSampled == 0 {
+		return
+	}
+
+	// Step 3: Calculate ratio
+	ratio := float64(expiredCount) / float64(totalSampled)
+
+	// Step 4: Decide whether to cleanup
+	if ratio < 0.25 {
+		fmt.Printf("[EXPIRY] sampled %d keys, %d expired (%.0f%%) -> Skipping\n", totalSampled, expiredCount, ratio*100)
+		return
+	}
+	fmt.Printf("[EXPIRY] sampled %d keys, %d expired (%.0f%%) -> Cleaning\n", totalSampled, expiredCount, ratio*100)
+
+	// Step 5: Hard Delete expired keys
+	s.hardDeleteBatch(500)
+
+}
+
+func (s *Store) hardDeleteBatch(limit int) {
+	result, err := s.db.Exec(`
+		DELETE from kv
+		WHERE expires_at IS NOT NULL
+		AND expires_at <= NOW()
+		LIMIT $1
+	`, limit)
+
+	if err != nil {
+		fmt.Println("[EXPIRY] Delete error:", err)
+		return
+	}
+	rowsDeleted, _ := result.RowsAffected()
+	if rowsDeleted > 0 {
+		fmt.Printf("[EXPIRY] Hard deleted %d keys\n", rowsDeleted)
+	}
+
+}
+
 func connectDB() *sql.DB {
 	connStr := "postgres://kvuser:kvpass@localhost:5432/kvdb?sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
@@ -53,8 +140,12 @@ func (s *Store) softDelete(key string) {
 // SET method write to DB without TTL
 func (s *Store) Set(key string, value []byte) error {
 	// write to db
-	_, err := s.db.Exec(`INSERT INTO kv (key, value) values ($1,$2) ON CONFLICT (key) DO UPDATE SET value = $2`,
-		key, value)
+	_, err := s.db.Exec(`
+		INSERT INTO kv (key, value, expires_at) 
+		VALUES ($1, $2, NULL) 
+		ON CONFLICT (key) 
+		DO UPDATE SET value = $2, expires_at = NULL
+	`, key, value)
 	if err != nil {
 		return err
 	}
@@ -102,11 +193,17 @@ func (s *Store) Get(key string) ([]byte, error) {
 		return entry.value, nil
 	}
 
-	// 2 cachce miss
+	// 2 cache miss - read from DB
 	var val []byte
 	var expiresAt *time.Time
 
-	err := s.db.QueryRow("SELECT value FROM kv WHERE key = $1 AND (expires_at IS NULL or expires_at > NOW())", key).Scan(&val, &expiresAt)
+	err := s.db.QueryRow(`
+		SELECT value, expires_at 
+		FROM kv 
+		WHERE key = $1 
+		  AND (expires_at IS NULL OR expires_at > NOW())
+	`, key).Scan(&val, &expiresAt)
+
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("key not found")
 	}
@@ -173,27 +270,47 @@ func main() {
 	// fmt.Println("User2:", string(user2))
 	// fmt.Println("User3:", string(user3))
 
-	fmt.Println("\n--- Testing TTL ---")
+	// fmt.Println("\n--- Testing TTL ---")
 
-	store.SetWithTTL("temp", []byte("expires-soon"), 3)
-	fmt.Println(" Set temp with 3 second TTL")
+	// store.SetWithTTL("temp", []byte("expires-soon"), 3)
+	// fmt.Println(" Set temp with 3 second TTL")
 
-	val, _ := store.Get("temp")
-	fmt.Println(" Immediate GET:", string(val))
+	// val, _ := store.Get("temp")
+	// fmt.Println(" Immediate GET:", string(val))
 
-	time.Sleep(2 * time.Second)
-	val, _ = store.Get("temp")
-	fmt.Println(" After 2 seconds:", string(val))
+	// time.Sleep(2 * time.Second)
+	// val, _ = store.Get("temp")
+	// fmt.Println(" After 2 seconds:", string(val))
 
-	time.Sleep(2 * time.Second)
-	val, err := store.Get("temp")
-	if err != nil {
-		fmt.Println(" After 4 seconds:", err)
+	// time.Sleep(2 * time.Second)
+	// val, err := store.Get("temp")
+	// if err != nil {
+	// 	fmt.Println(" After 4 seconds:", err)
+	// }
+
+	// // Test permanent key
+	// fmt.Println("\n--- Testing Permanent Key ---")
+	// store.Set("permanent", []byte("no-expiry"))
+	// val, _ = store.Get("permanent")
+	// fmt.Println(" Permanent key:", string(val))
+
+	store.StartExpiryWorker(3 * time.Second)
+
+	// Test: Create 200 keys with SHORT 1-second TTL
+	fmt.Println("\n--- Creating 200 keys with 1s TTL ---")
+	for i := 0; i < 200; i++ {
+		store.SetWithTTL(fmt.Sprintf("temp-%d", i), []byte("expires-fast"), 1)
 	}
+	fmt.Println("✓ Created 200 keys")
 
-	// Test permanent key
-	fmt.Println("\n--- Testing Permanent Key ---")
-	store.Set("permanent", []byte("no-expiry"))
-	val, _ = store.Get("permanent")
-	fmt.Println(" Permanent key:", string(val))
+	// Wait 2 seconds for all to expire
+	fmt.Println("\n--- Waiting 2 seconds for expiration... ---")
+	time.Sleep(2 * time.Second)
+
+	// Now worker should detect HIGH expiry ratio
+	fmt.Println("\n--- Worker should trigger cleanup now... ---")
+	time.Sleep(10 * time.Second)
+
+	fmt.Println("\n✓ Test complete")
+
 }
